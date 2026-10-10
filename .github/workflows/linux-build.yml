@@ -98,6 +98,11 @@ jobs:
           TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
+          # 本仓库特有的打包脚本不在上游 tag 里，切 tag 前先存到 RUNNER_TEMP，
+          # 否则 checkout 之后文件消失（fork 分支文件被上游内容覆盖）。
+          cp make-pacman-pkg.sh "$RUNNER_TEMP/make-pacman-pkg.sh"
+          chmod +x "$RUNNER_TEMP/make-pacman-pkg.sh"
+
           git remote add upstream "https://github.com/$UPSTREAM.git"
           # --depth 1 只要该 tag 与其提交；annotated tag 也一并取到
           git fetch --depth 1 upstream "refs/tags/$TAG:refs/tags/$TAG" \
@@ -183,8 +188,9 @@ jobs:
           DEB: ${{ steps.collect.outputs.deb }}
         run: |
           set -euo pipefail
-          # 上游 Tauri 链不产 pacman 包，用 deb 载荷转换（见脚本内说明）
-          EAC_VERSION="$VERSION" bash make-pacman-pkg.sh "$DEB" .
+          # 上游 Tauri 链不产 pacman 包，用 deb 载荷转换（见脚本内说明）。
+          # 脚本在切 tag 前已备份到 RUNNER_TEMP（上游 tag 里没有本文件）。
+          EAC_VERSION="$VERSION" bash "$RUNNER_TEMP/make-pacman-pkg.sh" "$DEB" .
           PKG="$(ls deepseek-harness-eac-*-x86_64.pkg.tar.zst | head -1)"
           [ -n "$PKG" ] || { echo "未生成 pacman 包"; exit 1; }
           echo "pacman=$PKG" >> "$GITHUB_OUTPUT"
