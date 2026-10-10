@@ -1,0 +1,241 @@
+name: Linux build & release
+
+# 上游只发 Windows 包，本 workflow 自动为 Linux 构建 deb 并发到本 fork 的 Releases。
+# 触发：每天定时检查上游 / 手动触发 / 本文件变更。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '上游 tag（留空 = 自动取最新正式版，如 V6.0.1）'
+        required: false
+        default: ''
+  schedule:
+    # 每天 UTC 04:00（北京时间 12:00）检查上游
+    - cron: '0 4 * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/linux-build.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linux-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Ebony-Vinyl/EAC-Desktop
+  NODE_VERSION: '24'
+  PNPM_VERSION: '11.7.0'
+
+jobs:
+  resolve:
+    name: 解析上游版本
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      need_build: ${{ steps.check.outputs.need_build }}
+    steps:
+      - name: 选择上游 tag
+        id: pick
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # 用 releases API 而非 tags API：后者按名字排序，会把 v6.0.0 排在 V6.0.1 前
+            TAG="$(curl -fsSL --retry 3 \
+              "https://api.github.com/repos/$UPSTREAM/releases?per_page=30" \
+              | python3 -c "
+          import sys, json, re
+          for r in json.load(sys.stdin):
+              if r.get('draft') or r.get('prerelease'):
+                  continue
+              t = r.get('tag_name', '')
+              if re.fullmatch(r'[Vv]\d+\.\d+\.\d+', t):
+                  print(t); break
+          ")"
+          fi
+          [ -n "$TAG" ] || { echo "无法解析上游 tag"; exit 1; }
+          VERSION="$(echo "$TAG" | sed 's/^[Vv]//')"
+          echo "上游 tag=$TAG  version=$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 检查是否已发布
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.pick.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "linux-v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "已存在 linux-v$VERSION，跳过构建"
+            echo "need_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "需要构建 linux-v$VERSION"
+            echo "need_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: 构建 Linux deb
+    needs: resolve
+    if: needs.resolve.outputs.need_build == 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout（fork，含完整 tag 空间）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 取上游 tag 并切换
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          # --depth 1 只要该 tag 与其提交；annotated tag 也一并取到
+          git fetch --depth 1 upstream "refs/tags/$TAG:refs/tags/$TAG" \
+            || git fetch upstream "refs/tags/$TAG:refs/tags/$TAG"
+          git checkout --detach "$TAG"
+          git submodule update --init --recursive
+          echo "已切换到 $TAG（$(git rev-parse --short HEAD)）"
+          node tauri-shell/check-dpx-pin.mjs
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: dsh-desktop/package-lock.json
+
+      - name: 安装 pnpm（内核构建要求钉版）
+        run: npm install --global pnpm@${{ env.PNPM_VERSION }} && pnpm --version
+
+      - name: 安装 Linux 构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2 rpm
+
+      - name: 缓存内核与 Rust 构建产物
+        uses: actions/cache@v4
+        with:
+          path: |
+            dsh-desktop/vendor/kernel
+            tauri-shell/target
+          key: linux-x64-${{ needs.resolve.outputs.version }}-${{ hashFiles('dsh-desktop/scripts/fetch-kernel.js', 'tauri-shell/Cargo.lock') }}
+          restore-keys: |
+            linux-x64-${{ needs.resolve.outputs.version }}-
+            linux-x64-
+
+      - name: 构建 dsh 内核
+        working-directory: dsh-desktop
+        run: node scripts/fetch-kernel.js
+
+      - name: 安装依赖
+        working-directory: dsh-desktop
+        run: npm run ci:install
+
+      - name: 取随包 Node/npm/pnpm 运行时
+        working-directory: dsh-desktop
+        run: npm run fetch-runtime
+
+      - name: 预取 Cargo 依赖
+        working-directory: tauri-shell
+        run: cargo fetch --locked
+
+      - name: 装配 Linux 运行时资源
+        run: node tauri-shell/stage-resources.mjs --target=linux --skip-npm
+
+      - name: 校验资源闭包
+        run: node dsh-desktop/scripts/verify-staged-runtime.mjs
+
+      - name: 构建 deb
+        working-directory: tauri-shell
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: npx -y @tauri-apps/cli@2 build --bundles deb --verbose
+
+      - name: 整理产物
+        id: collect
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          SRC_DEB="$(find tauri-shell/target/release/bundle/deb -maxdepth 1 -name '*.deb' -print -quit)"
+          [ -n "$SRC_DEB" ] || { echo "未找到 deb 产物"; exit 1; }
+          OUT="Deepseek-Harness-EAC-v$VERSION-linux-x64.deb"
+          cp "$SRC_DEB" "$OUT"
+          sha256sum "$OUT" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh "$OUT"
+          echo "deb=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: 生成 Release 说明
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DEB: ${{ steps.collect.outputs.deb }}
+        run: |
+          set -euo pipefail
+          {
+            echo "由 GitHub Actions 从上游 \`$UPSTREAM\` 的 \`$TAG\` 源码构建的 Linux x64 deb。"
+            echo ""
+            echo "上游只发布 Windows 包，本 Release 是自动构建的 Linux 版本。"
+            echo ""
+            echo "## 安装"
+            echo ""
+            echo '```sh'
+            echo "curl -LO https://github.com/$GITHUB_REPOSITORY/releases/download/linux-v$VERSION/$DEB"
+            echo '```'
+            echo ""
+            echo "免 root 安装（用户级）："
+            echo ""
+            echo '```sh'
+            echo "bsdtar xf \"$DEB\" data.tar.gz && bsdtar xf data.tar.gz"
+            echo "mkdir -p ~/.local/opt"
+            echo "cp -r \"usr/lib/Deepseek Harness EAC\" ~/.local/opt/"
+            echo '```'
+            echo ""
+            echo "或使用配套脚本 \`update-eac.sh\`。"
+            echo ""
+            echo "## 校验"
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } > RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
+      - name: 发布 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          DEB: ${{ steps.collect.outputs.deb }}
+        run: |
+          set -euo pipefail
+          gh release create "linux-v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Linux v$VERSION" \
+            --target "$GITHUB_SHA" \
+            --notes-file RELEASE_NOTES.md \
+            "$DEB" SHA256SUMS.txt
+
+      - name: 同步上游 tag 与 main 到 fork
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git push origin "refs/tags/$TAG:refs/tags/$TAG" || true
+          # merge-upstream：快进或生成合并提交，不会丢失本 workflow 文件
+          gh api -X POST "repos/$GITHUB_REPOSITORY/merge-upstream" \
+            -f branch=main >/dev/null 2>&1 && echo "main 已同步" \
+            || echo "main 同步跳过（可能已是最新或需手动处理）"
